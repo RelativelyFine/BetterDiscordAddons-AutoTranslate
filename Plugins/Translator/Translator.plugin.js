@@ -67,6 +67,7 @@ module.exports = (_ => {
 		const translateIconMask = `<mask id="translateIconMask" fill="black"><path fill="white" d="M 0 0 H 24 V 24 H 0 Z"/><path fill="black" d="M24 12 H 12 V 24 H 24 Z"/></mask>`;
 		const translateIcon = translateIconGeneral.replace(`<extra/>`, ``).replace(`<mask/>`, ``).replace(` mask="url(#translateIconMask)"`, ``);
 		const translateIconUntranslate = translateIconGeneral.replace(`<extra/>`, `<path fill="none" stroke="#f04747" stroke-width="2" d="m 14.702359,14.702442 8.596228,8.596148 m 0,-8.597139 -8.59722,8.596147 z"/>`).replace(`<mask/>`, translateIconMask);
+		const Dispatcher = BdApi.findModuleByProps("subscribe", "dispatch");
 		
 		const TranslateButtonComponent = class TranslateButton extends BdApi.React.Component {
 			render() {
@@ -535,13 +536,36 @@ module.exports = (_ => {
 								delete autoTranslatedMessages[messageId];
 							}
 						}
-						BDFDB.MessageUtils.rerenderAll(true);
+						this.rerenderSingleMessage(message);
 					}
 				}});
+
+				this._onMessageCreate = event => {
+					const msg       = event.message || event.d;
+					if (!msg || !msg.id) return;
+
+					const channelId = msg.channel_id || msg.channel?.id;
+					const selected  = BDFDB.LibraryStores.SelectedChannelStore.getChannelId();
+
+					if (channelId !== selected) return;
+					if (!autoTranslateStates[channelId]) return;
+					if (msg.author.id === BDFDB.LibraryStores.UserStore.getCurrentUser().id) return;
+
+					if (translatedMessages[msg.id] || autoTranslatedMessages[msg.id]) return;
+					autoTranslatedMessages[msg.id] = true;
+
+					autoTranslateQueue.push({
+						message: msg,
+						channel: BDFDB.LibraryStores.ChannelStore.getChannel(channelId)
+					});
+					this.processAutoTranslateQueue();
+				};
+				Dispatcher.subscribe("MESSAGE_CREATE", this._onMessageCreate);
 				this.forceUpdateAll();
 			}
 			
 			onStop () {
+				Dispatcher.unsubscribe("MESSAGE_CREATE", this._onMessageCreate);
 				this.forceUpdateAll();
 			}
 
@@ -1007,50 +1031,14 @@ module.exports = (_ => {
 			}
 
 			processMessages (e) {
-				const channelId = e.instance.props.channel?.id;
-				const isAutoTranslateEnabled = autoTranslateStates[channelId];
-				const selectedChannelId = BDFDB.LibraryStores.SelectedChannelStore.getChannelId();
-
 				e.instance.props.channelStream = [].concat(e.instance.props.channelStream);
 				for (let i in e.instance.props.channelStream) {
 					let message = e.instance.props.channelStream[i].content;
 					if (message) {
-						if (BDFDB.ArrayUtils.is(message.attachments)) {
-							this.checkMessage(e.instance.props.channelStream[i], message);
-
-							if (isAutoTranslateEnabled && channelId === selectedChannelId && 
-								message.author.id !== BDFDB.LibraryStores.UserStore.getCurrentUser().id &&
-								!translatedMessages[message.id] && !autoTranslatedMessages[message.id]) {
-
-								autoTranslatedMessages[message.id] = true;
-
-								autoTranslateQueue.push({
-									message: message,
-									channel: e.instance.props.channel
-								});
-
-								processAutoTranslateQueue();
-							}
-						}
+						if (BDFDB.ArrayUtils.is(message.attachments)) this.checkMessage(e.instance.props.channelStream[i], message);
 						else if (BDFDB.ArrayUtils.is(message)) for (let j in message) {
 							let childMessage = message[j].content;
-							if (childMessage && BDFDB.ArrayUtils.is(childMessage.attachments)) {
-								this.checkMessage(message[j], childMessage);
-
-								if (isAutoTranslateEnabled && channelId === selectedChannelId && 
-									childMessage.author.id !== BDFDB.LibraryStores.UserStore.getCurrentUser().id &&
-									!translatedMessages[childMessage.id] && !autoTranslatedMessages[childMessage.id]) {
-
-									autoTranslatedMessages[childMessage.id] = true;
-
-									autoTranslateQueue.push({
-										message: childMessage,
-										channel: e.instance.props.channel
-									});
-
-									processAutoTranslateQueue();
-								}
-							}
+							if (childMessage && BDFDB.ArrayUtils.is(childMessage.attachments)) this.checkMessage(message[j], childMessage);
 						}
 					}
 				}
@@ -1308,7 +1296,7 @@ module.exports = (_ => {
 									input,
 									output
 								};
-								BDFDB.MessageUtils.rerenderAll(true);
+								this.rerenderSingleMessage(message);
 							}
 							callback(true);
 						});
@@ -1993,6 +1981,36 @@ module.exports = (_ => {
 					});
 				}
 				return [newString.join(" "), excepts, newString.length-count != 0];
+			}
+
+			rerenderSingleMessage (message) {
+				const data = translatedMessages[message.id];
+				if (!data) return;
+
+				const newEmbeds = (message.embeds || []).map(embed => {
+					const e = data.embeds[embed.id];
+					return {
+					...embed,
+					rawDescription: e.description,
+					rawTitle:       e.title,
+					footer: { ...embed.footer, text: e.footerText },
+					fields: e.fields.map(f => ({
+						rawName:  f.name,
+						rawValue: f.value
+					}))
+					};
+				});
+
+				const updated = {
+					...message,
+					content: data.content,
+					embeds:  newEmbeds
+				};
+
+				Dispatcher.dispatch({
+					type:    "MESSAGE_UPDATE",
+					message: updated
+				});
 			}
 
 			getGoogleTranslatePageURL (input, output, text) {
