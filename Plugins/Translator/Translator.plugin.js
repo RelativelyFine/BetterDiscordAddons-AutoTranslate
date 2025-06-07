@@ -105,7 +105,37 @@ module.exports = (_ => {
 				});
 			}
 		};
-		
+
+		const AutoTranslateToggleComponent = class AutoTranslateToggle extends BdApi.React.Component {
+			render() {
+				const enabled = autoTranslateStates[this.props.channelId];
+				return BDFDB.ReactUtils.createElement(BDFDB.LibraryComponents.TooltipContainer, {
+					text: enabled ? "Disable Auto-Translate" : "Enable Auto-Translate",
+					children: BDFDB.ReactUtils.createElement(BDFDB.LibraryComponents.Clickable, {
+						className: BDFDB.DOMUtils.formatClassName(BDFDB.disCN.iconWrapper, BDFDB.disCN.clickable),
+						onClick: _ => {
+							if (enabled) {
+								delete autoTranslateStates[this.props.channelId];
+							} else {
+								autoTranslateStates[this.props.channelId] = true;
+							}
+							BDFDB.DataUtils.save(autoTranslateStates, _this, "autoTranslateStates");
+							BDFDB.ReactUtils.forceUpdate(this);
+							BDFDB.MessageUtils.rerenderAll(true);
+						},
+						children: BDFDB.ReactUtils.createElement(BDFDB.LibraryComponents.SvgIcon, {
+							width: 20,
+							height: 20,
+							className: BDFDB.DOMUtils.formatClassName(BDFDB.disCN.channelheadericon),
+							foreground: BDFDB.disCN.channelheadericonforeground,
+							name: enabled ? BDFDB.LibraryComponents.SvgIcon.Names.NOVA_AT : BDFDB.LibraryComponents.SvgIcon.Names.NOVA_AT_PENDING,
+							color: enabled ? "var(--status-positive)" : "currentColor"
+						})
+					})
+				});
+			}
+		};
+
 		const TranslateSettingsComponent = class TranslateSettings extends BdApi.React.Component {
 			filterLanguages(direction, place) {
 				let isOutput = direction == languageTypes.OUTPUT;
@@ -273,7 +303,20 @@ module.exports = (_ => {
 							_this.toggleTranslation(this.props.channelId);
 							BDFDB.ReactUtils.forceUpdate(this);
 						}
-					})
+					}),
+					_this.settings.general.autoTranslateIncoming && BDFDB.ReactUtils.createElement(BDFDB.LibraryComponents.SettingsItem, {
+						type: "Switch",
+						label: _this.labels.auto_translate_incoming || "Auto-translate incoming messages in this channel",
+						tag: BDFDB.LibraryComponents.FormTitle.Tags.H5,
+						value: autoTranslateStates[this.props.channelId] || false,
+						onChange: value => {
+							if (value) autoTranslateStates[this.props.channelId] = true;
+							else delete autoTranslateStates[this.props.channelId];
+							BDFDB.DataUtils.save(autoTranslateStates, _this, "autoTranslateStates");
+							BDFDB.ReactUtils.forceUpdate(this);
+							BDFDB.MessageUtils.rerenderAll(true);
+						}
+					}),
 				].flat(10).filter(n => n);
 			}
 		};
@@ -374,6 +417,10 @@ module.exports = (_ => {
 		var channelLanguages = {}, guildLanguages = {};
 		var translationEnabledStates = [], isTranslating;
 		var translatedMessages = {}, oldMessages = {};
+		var autoTranslateStates = {};
+		var autoTranslatedMessages = {};
+		var autoTranslateQueue = [];
+		var isProcessingQueue = false;
 		
 		const defaultLanguages = {
 			INPUT: "auto",
@@ -399,7 +446,8 @@ module.exports = (_ => {
 						usePerChatTranslation:		{value: true, 	popout: false},
 						sendOriginalMessage:		{value: false, 	popout: true},
 						showOriginalMessage:		{value: false, 	popout: true},
-						useSpoilerInOriginal:		{value: false, 	popout: false,	description: "Use Spoilers instead of Quotes for the original Message Text"}
+						useSpoilerInOriginal:		{value: false, 	popout: false,	description: "Use Spoilers instead of Quotes for the original Message Text"},
+						autoTranslateIncoming: {value: true, popout: false, description: "Enable Auto-Translate option for incoming messages"}
 					},
 					choices: {},
 					exceptions: {
@@ -432,7 +480,8 @@ module.exports = (_ => {
 						"ChannelTextAreaButtons",
 						"Embed",
 						"MessageButtons",
-						"MessageContent"
+						"MessageContent",
+						"HeaderBarContainer"
 					]
 				};
 
@@ -468,6 +517,25 @@ module.exports = (_ => {
 							}),
 							action: _ => this.translateMessage(e.instance.props.message, e.instance.props.channel)
 						}));
+					}
+				}});
+				BDFDB.PatchUtils.patch(this, BDFDB.LibraryModules.HistoryUtils, "transitionTo", {after: e => {
+					autoTranslateQueue = [];
+
+					const translatedCount = Object.keys(translatedMessages).length;
+					if (translatedCount > 10000) {
+						const messageIds = Object.keys(translatedMessages).sort((a, b) => b - a);
+
+						const idsToKeep = new Set(messageIds.slice(0, 5000));
+
+						for (let messageId in translatedMessages) {
+							if (!idsToKeep.has(messageId)) {
+								delete translatedMessages[messageId];
+								delete oldMessages[messageId];
+								delete autoTranslatedMessages[messageId];
+							}
+						}
+						BDFDB.MessageUtils.rerenderAll(true);
 					}
 				}});
 				this.forceUpdateAll();
@@ -726,6 +794,8 @@ module.exports = (_ => {
 				
 				translationEnabledStates = BDFDB.DataUtils.load(this, "translationEnabledStates");
 				translationEnabledStates = BDFDB.ArrayUtils.is(translationEnabledStates) ? translationEnabledStates : [];
+
+				autoTranslateStates = BDFDB.DataUtils.load(this, "autoTranslateStates") || {};
 				
 				this.setLanguages();
 				BDFDB.PatchUtils.forceAllUpdates(this);
@@ -923,20 +993,69 @@ module.exports = (_ => {
 				}));
 			}
 
+			processHeaderBarContainer (e) {
+				if (!this.settings.general.autoTranslateIncoming) return;
+				let channel = BDFDB.LibraryStores.ChannelStore.getChannel(e.instance.props.channelId);
+				if (!channel || channel.type != BDFDB.DiscordConstants.ChannelTypes.GUILD_TEXT && channel.type != BDFDB.DiscordConstants.ChannelTypes.DM && channel.type != BDFDB.DiscordConstants.ChannelTypes.GROUP_DM) return;
+
+				let [children, index] = BDFDB.ReactUtils.findParent(e.returnvalue, {name: "HeaderBarIcon"});
+				if (index > -1) {
+					children.splice(index, 0, BDFDB.ReactUtils.createElement(AutoTranslateToggleComponent, {
+						channelId: channel.id
+					}));
+				}
+			}
+
 			processMessages (e) {
+				const channelId = e.instance.props.channel?.id;
+				const isAutoTranslateEnabled = autoTranslateStates[channelId];
+				const selectedChannelId = BDFDB.LibraryStores.SelectedChannelStore.getChannelId();
+
 				e.instance.props.channelStream = [].concat(e.instance.props.channelStream);
 				for (let i in e.instance.props.channelStream) {
 					let message = e.instance.props.channelStream[i].content;
 					if (message) {
-						if (BDFDB.ArrayUtils.is(message.attachments)) this.checkMessage(e.instance.props.channelStream[i], message);
+						if (BDFDB.ArrayUtils.is(message.attachments)) {
+							this.checkMessage(e.instance.props.channelStream[i], message);
+
+							if (isAutoTranslateEnabled && channelId === selectedChannelId && 
+								message.author.id !== BDFDB.LibraryStores.UserStore.getCurrentUser().id &&
+								!translatedMessages[message.id] && !autoTranslatedMessages[message.id]) {
+
+								autoTranslatedMessages[message.id] = true;
+
+								autoTranslateQueue.push({
+									message: message,
+									channel: e.instance.props.channel
+								});
+
+								processAutoTranslateQueue();
+							}
+						}
 						else if (BDFDB.ArrayUtils.is(message)) for (let j in message) {
 							let childMessage = message[j].content;
-							if (childMessage && BDFDB.ArrayUtils.is(childMessage.attachments)) this.checkMessage(message[j], childMessage);
+							if (childMessage && BDFDB.ArrayUtils.is(childMessage.attachments)) {
+								this.checkMessage(message[j], childMessage);
+
+								if (isAutoTranslateEnabled && channelId === selectedChannelId && 
+									childMessage.author.id !== BDFDB.LibraryStores.UserStore.getCurrentUser().id &&
+									!translatedMessages[childMessage.id] && !autoTranslatedMessages[childMessage.id]) {
+
+									autoTranslatedMessages[childMessage.id] = true;
+
+									autoTranslateQueue.push({
+										message: childMessage,
+										channel: e.instance.props.channel
+									});
+
+									processAutoTranslateQueue();
+								}
+							}
 						}
 					}
 				}
 			}
-			
+
 			checkMessage (stream, message) {
 				let translation = translatedMessages[message.id];
 				if (translation) stream.content.content = translation.content;
@@ -1023,16 +1142,38 @@ module.exports = (_ => {
 					delete e.instance.props.embed.originalFooter;
 				}
 			}
-			
+
 			toggleTranslation (channelId) {
 				if (!this.isTranslationEnabled(channelId)) translationEnabledStates.push(this.settings.general.usePerChatTranslation ? channelId : "global");
 				else BDFDB.ArrayUtils.remove(translationEnabledStates, this.settings.general.usePerChatTranslation ? channelId : "global", true);
 				BDFDB.DataUtils.save(translationEnabledStates, this, "translationEnabledStates");
 			}
-			
+
 			isTranslationEnabled (channelId) {
 				return translationEnabledStates.includes(this.settings.general.usePerChatTranslation ? channelId : "global");
 			}
+
+			processAutoTranslateQueue = async () => {
+				if (isProcessingQueue || autoTranslateQueue.length === 0) return;
+
+				isProcessingQueue = true;
+
+				while (autoTranslateQueue.length > 0) {
+					const {message, channel} = autoTranslateQueue.shift();
+
+					if (autoTranslateStates[channel.id] && 
+						channel.id === BDFDB.LibraryStores.SelectedChannelStore.getChannelId()) {
+
+						await this.translateMessage(message, channel);
+					}
+
+					if (autoTranslateQueue.length > 0) {
+						await new Promise(resolve => BDFDB.TimeUtils.timeout(resolve, 500));
+					}
+				}
+
+				isProcessingQueue = false;
+			};
 
 			setLanguages () {
 				if (this.settings.engines.translator == this.settings.engines.backup) {
@@ -1113,6 +1254,7 @@ module.exports = (_ => {
 					if (!message) return callback(null);
 					if (translatedMessages[message.id]) {
 						delete translatedMessages[message.id];
+						delete autoTranslatedMessages[message.id];
 						BDFDB.MessageUtils.rerenderAll(true);
 						callback(false);
 					}
@@ -1894,7 +2036,8 @@ module.exports = (_ => {
 							toast_translating_tryanother:				"Опитайте друг преводач",
 							translate_your_message:					"Преведете вашите съобщения преди изпращане",
 							translated_watermark:					"преведено",
-							translator_engine:					"Преводач"
+							translator_engine:					"Преводач",
+							auto_translate_incoming:				"Автоматично превежда входящите съобщения в този канал"
 						};
 					case "cs":		// Czech
 						return {
@@ -1931,7 +2074,8 @@ module.exports = (_ => {
 							toast_translating_tryanother:				"Zkuste jiný překladač",
 							translate_your_message:					"Před odesláním si zprávy přeložte",
 							translated_watermark:					"přeloženo",
-							translator_engine:					"Překladatel"
+							translator_engine:					"Překladatel",
+							auto_translate_incoming:				"Automaticky přeložit příchozí zprávy v tomto kanálu"
 						};
 					case "da":		// Danish
 						return {
@@ -1968,7 +2112,8 @@ module.exports = (_ => {
 							toast_translating_tryanother:				"Prøv en anden oversætter",
 							translate_your_message:					"Oversæt dine beskeder før afsendelse",
 							translated_watermark:					"oversat",
-							translator_engine:					"Oversætter"
+							translator_engine:					"Oversætter",
+							auto_translate_incoming:				"Automatisk oversæt indkommende beskeder i denne kanal"
 						};
 					case "de":		// German
 						return {
@@ -2005,7 +2150,8 @@ module.exports = (_ => {
 							toast_translating_tryanother:				"Versuch einen anderen Übersetzer",
 							translate_your_message:					"Übersetzt Nachrichten vor dem Senden",
 							translated_watermark:					"übersetzt",
-							translator_engine:					"Übersetzer"
+							translator_engine:					"Übersetzer",
+							auto_translate_incoming:				"Automatisch eingehende Nachrichten in diesem Kanal übersetzen"
 						};
 					case "el":		// Greek
 						return {
@@ -2042,7 +2188,8 @@ module.exports = (_ => {
 							toast_translating_tryanother:				"Δοκιμάστε έναν άλλο Μεταφραστή",
 							translate_your_message:					"Μεταφράστε τα Μηνύματά σας πριν την αποστολή",
 							translated_watermark:					"μεταφρασμένο",
-							translator_engine:					"Μεταφράστης"
+							translator_engine:					"Μεταφράστης",
+							auto_translate_incoming:				"Αυτόματη μετάφραση εισερχόμενων μηνυμάτων σε αυτό το κανάλι"
 						};
 					case "es":		// Spanish
 						return {
@@ -2079,7 +2226,8 @@ module.exports = (_ => {
 							toast_translating_tryanother:				"Prueba con otro traductor",
 							translate_your_message:					"Traduce tus mensajes antes de enviarlos",
 							translated_watermark:					"traducido",
-							translator_engine:					"Traductor"
+							translator_engine:					"Traductor",
+							auto_translate_incoming:				"Traduce automáticamente los mensajes entrantes en este canal"
 						};
 					case "es-419":		// Spanish (Latin America)
 						return {
@@ -2116,7 +2264,8 @@ module.exports = (_ => {
 							toast_translating_tryanother:				"Prueba otro traductor",
 							translate_your_message:					"Traducir sus mensajes antes de enviar",
 							translated_watermark:					"traducido",
-							translator_engine:					"Traductor"
+							translator_engine:					"Traductor",
+							auto_translate_incoming:				"Traduce automáticamente los mensajes entrantes en este canal"
 						};
 					case "fi":		// Finnish
 						return {
@@ -2153,7 +2302,8 @@ module.exports = (_ => {
 							toast_translating_tryanother:				"Kokeile toista kääntäjää",
 							translate_your_message:					"Käännä viestisi ennen lähettämistä",
 							translated_watermark:					"käännetty",
-							translator_engine:					"Kääntäjä"
+							translator_engine:					"Kääntäjä",
+							auto_translate_incoming:				"Automaattinen käännös saapuviin viesteihin tässä kanavassa"
 						};
 					case "fr":		// French
 						return {
@@ -2190,7 +2340,8 @@ module.exports = (_ => {
 							toast_translating_tryanother:				"Essayez un autre traducteur",
 							translate_your_message:					"Traduisez vos messages avant de les envoyer",
 							translated_watermark:					"traduit",
-							translator_engine:					"Traducteur"
+							translator_engine:					"Traducteur",
+							auto_translate_incoming:				"Traduire automatiquement les messages entrants dans ce canal"
 						};
 					case "hi":		// Hindi
 						return {
@@ -2227,7 +2378,8 @@ module.exports = (_ => {
 							toast_translating_tryanother:				"दूसरे अनुवादक का प्रयास करें",
 							translate_your_message:					"भेजने से पहले अपने संदेशों का अनुवाद करें",
 							translated_watermark:					"अनुवाद",
-							translator_engine:					"अनुवादक"
+							translator_engine:					"अनुवादक",
+							auto_translate_incoming:				"इस चैनल में आने वाले संदेशों का स्वचालित अनुवाद करें"
 						};
 					case "hr":		// Croatian
 						return {
@@ -2264,7 +2416,8 @@ module.exports = (_ => {
 							toast_translating_tryanother:				"Pokušajte s drugim prevoditeljem",
 							translate_your_message:					"Prevedite svoje poruke prije slanja",
 							translated_watermark:					"prevedeno",
-							translator_engine:					"Prevoditelj"
+							translator_engine:					"Prevoditelj",
+							auto_translate_incoming:				"Automatski prevodi dolazne poruke u ovom kanalu"
 						};
 					case "hu":		// Hungarian
 						return {
@@ -2301,7 +2454,8 @@ module.exports = (_ => {
 							toast_translating_tryanother:				"Próbálkozzon másik fordítóval",
 							translate_your_message:					"Küldés előtt fordítsa le az üzeneteit",
 							translated_watermark:					"lefordított",
-							translator_engine:					"Fordító"
+							translator_engine:					"Fordító",
+							auto_translate_incoming:				"Automatikusan fordítja a bejövő üzeneteket ebben a csatornában"
 						};
 					case "it":		// Italian
 						return {
@@ -2338,7 +2492,8 @@ module.exports = (_ => {
 							toast_translating_tryanother:				"Prova un altro traduttore",
 							translate_your_message:					"Traduci i tuoi messaggi prima di inviarli",
 							translated_watermark:					"tradotto",
-							translator_engine:					"Traduttore"
+							translator_engine:					"Traduttore",
+							auto_translate_incoming:				"Traduci automaticamente i messaggi in arrivo in questo canale"
 						};
 					case "ja":		// Japanese
 						return {
@@ -2375,7 +2530,8 @@ module.exports = (_ => {
 							toast_translating_tryanother:				"別の翻訳者を試す",
 							translate_your_message:					"送信する前にメッセージを翻訳する",
 							translated_watermark:					"翻訳済み",
-							translator_engine:					"翻訳者"
+							translator_engine:					"翻訳者",
+							auto_translate_incoming:				"このチャンネルの受信メッセージを自動翻訳する"
 						};
 					case "ko":		// Korean
 						return {
@@ -2412,7 +2568,8 @@ module.exports = (_ => {
 							toast_translating_tryanother:				"다른 번역기 시도",
 							translate_your_message:					"보내기 전에 메시지 번역",
 							translated_watermark:					"번역",
-							translator_engine:					"역자"
+							translator_engine:					"역자",
+							auto_translate_incoming:				"이 채널의 수신 메시지를 자동 번역합니다"
 						};
 					case "lt":		// Lithuanian
 						return {
@@ -2449,7 +2606,8 @@ module.exports = (_ => {
 							toast_translating_tryanother:				"Išbandykite kitą vertėją",
 							translate_your_message:					"Prieš siųsdami išverskite savo pranešimus",
 							translated_watermark:					"išverstas",
-							translator_engine:					"Vertėjas"
+							translator_engine:					"Vertėjas",
+							auto_translate_incoming:				"Automatiškai versti atkeliaujančias žinutes šiame kanale"
 						};
 					case "nl":		// Dutch
 						return {
@@ -2486,7 +2644,8 @@ module.exports = (_ => {
 							toast_translating_tryanother:				"Probeer een andere vertaler",
 							translate_your_message:					"Vertaal uw berichten voordat u ze verzendt",
 							translated_watermark:					"vertaald",
-							translator_engine:					"Vertaler"
+							translator_engine:					"Vertaler",
+							auto_translate_incoming:				"Automatisch binnenkomende berichten in dit kanaal vertalen"
 						};
 					case "no":		// Norwegian
 						return {
@@ -2523,7 +2682,8 @@ module.exports = (_ => {
 							toast_translating_tryanother:				"Prøv en annen oversetter",
 							translate_your_message:					"Oversett meldingene dine før sending",
 							translated_watermark:					"oversatt",
-							translator_engine:					"Oversetter"
+							translator_engine:					"Oversetter",
+							auto_translate_incoming:				"Automatisk oversett innkommende meldinger i denne kanalen"
 						};
 					case "pl":		// Polish
 						return {
@@ -2560,7 +2720,8 @@ module.exports = (_ => {
 							toast_translating_tryanother:				"Wypróbuj innego tłumacza",
 							translate_your_message:					"Przetłumacz swoje wiadomości przed wysłaniem",
 							translated_watermark:					"przetłumaczony",
-							translator_engine:					"Tłumacz"
+							translator_engine:					"Tłumacz",
+							auto_translate_incoming:				"Automatycznie tłumacz przychodzące wiadomości w tym kanale"
 						};
 					case "pt-BR":		// Portuguese (Brazil)
 						return {
@@ -2597,7 +2758,8 @@ module.exports = (_ => {
 							toast_translating_tryanother:				"Tente outro tradutor",
 							translate_your_message:					"Traduza suas mensagens antes de enviar",
 							translated_watermark:					"traduzido",
-							translator_engine:					"Tradutor"
+							translator_engine:					"Tradutor",
+							auto_translate_incoming:					"Traduz automaticamente mensagens recebidas neste canal"
 						};
 					case "ro":		// Romanian
 						return {
@@ -2634,7 +2796,8 @@ module.exports = (_ => {
 							toast_translating_tryanother:				"Încercați un alt traducător",
 							translate_your_message:					"Traduceți mesajele înainte de a le trimite",
 							translated_watermark:					"tradus",
-							translator_engine:					"Traducător"
+							translator_engine:					"Traducător",
+							auto_translate_incoming:				"Traduc automat mesajele primite în acest canal"
 						};
 					case "ru":		// Russian
 						return {
@@ -2671,7 +2834,8 @@ module.exports = (_ => {
 							toast_translating_tryanother:				"Попробуйте другой переводчик",
 							translate_your_message:					"Переводите свои сообщения перед отправкой",
 							translated_watermark:					"переведено",
-							translator_engine:					"Переводчик"
+							translator_engine:					"Переводчик",
+							auto_translate_incoming:				"Автоматически переводить входящие сообщения в этом канале"
 						};
 					case "sv":		// Swedish
 						return {
@@ -2708,7 +2872,8 @@ module.exports = (_ => {
 							toast_translating_tryanother:				"Prova en annan översättare",
 							translate_your_message:					"Översätt dina meddelanden innan du skickar",
 							translated_watermark:					"översatt",
-							translator_engine:					"Översättare"
+							translator_engine:					"Översättare",
+							auto_translate_incoming:				"Automatiskt översätt inkommande meddelanden i den här kanalen"
 						};
 					case "th":		// Thai
 						return {
@@ -2745,7 +2910,8 @@ module.exports = (_ => {
 							toast_translating_tryanother:				"ลองใช้นักแปลคนอื่น",
 							translate_your_message:					"แปลข้อความของคุณก่อนส่ง",
 							translated_watermark:					"แปล",
-							translator_engine:					"นักแปล"
+							translator_engine:					"นักแปล",
+							auto_translate_incoming:				"แปลข้อความขาเข้าของช่องนี้โดยอัตโนมัติ"
 						};
 					case "tr":		// Turkish
 						return {
@@ -2782,7 +2948,8 @@ module.exports = (_ => {
 							toast_translating_tryanother:				"Başka bir Çevirmen deneyin",
 							translate_your_message:					"Göndermeden önce Mesajlarınızı çevirin",
 							translated_watermark:					"tercüme",
-							translator_engine:					"Çevirmen"
+							translator_engine:					"Çevirmen",
+							auto_translate_incoming:				"Bu kanaldaki gelen mesajları otomatik çevir"
 						};
 					case "uk":		// Ukrainian
 						return {
@@ -2819,7 +2986,8 @@ module.exports = (_ => {
 							toast_translating_tryanother:				"Спробуйте іншого перекладача",
 							translate_your_message:					"Перекладіть свої повідомлення перед надсиланням",
 							translated_watermark:					"переклав",
-							translator_engine:					"Перекладач"
+							translator_engine:					"Перекладач",
+							auto_translate_incoming:				"Автоматично перекладати вхідні повідомлення в цьому каналі"
 						};
 					case "vi":		// Vietnamese
 						return {
@@ -2856,7 +3024,8 @@ module.exports = (_ => {
 							toast_translating_tryanother:				"Thử một Trình dịch khác",
 							translate_your_message:					"Dịch Tin nhắn của bạn trước khi gửi",
 							translated_watermark:					"đã dịch",
-							translator_engine:					"Người phiên dịch"
+							translator_engine:					"Người phiên dịch",
+							auto_translate_incoming:					"Tự động dịch tin nhắn đến trong kênh này"
 						};
 					case "zh-CN":		// Chinese (China)
 						return {
@@ -2893,7 +3062,8 @@ module.exports = (_ => {
 							toast_translating_tryanother:				"尝试其它翻译器",
 							translate_your_message:					"发送前翻译您的消息",
 							translated_watermark:					"已翻译",
-							translator_engine:					"译者"
+							translator_engine:					"译者",
+							auto_translate_incoming:				"自动翻译此频道的所有来信消息"
 						};
 					case "zh-TW":		// Chinese (Taiwan)
 						return {
@@ -2930,7 +3100,8 @@ module.exports = (_ => {
 							toast_translating_tryanother:				"嘗試其它翻譯器",
 							translate_your_message:					"發送前翻譯您的消息",
 							translated_watermark:					"已翻譯",
-							translator_engine:					"譯者"
+							translator_engine:					"譯者",
+							auto_translate_incoming:					"自動翻譯此頻道的所有傳入訊息"
 						};
 					default:		// English
 						return {
@@ -2967,7 +3138,8 @@ module.exports = (_ => {
 							toast_translating_tryanother:				"Try another Translator",
 							translate_your_message:					"Translate your Messages before sending",
 							translated_watermark:					"translated",
-							translator_engine:					"Translator"
+							translator_engine:					"Translator",
+							auto_translate_incoming: "Auto-translate incoming messages in this channel",
 						};
 				}
 			}
