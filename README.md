@@ -2,7 +2,8 @@
 This fork aims at supporting automatic translation of incoming messages within the "Translator" plugin.
 
 TODO: 
-- Everything :P
+- bug test
+- implement a translate X past messages feature
 
 # Original README
 # [BetterDiscord](https://github.com/BetterDiscord/BetterDiscord) Addons [![Support][support-badge]][support-link] [![PayPal][paypal-badge]][paypal-link] [![Patreon][patreon-badge]][patreon-link]
