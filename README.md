@@ -1,5 +1,6 @@
 # What this fork offers:
 This fork aims at supporting automatic translation of incoming messages within the "Translator" plugin.
+
 TODO: 
 - Everything :P
 
